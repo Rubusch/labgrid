@@ -1,0 +1,22 @@
+targets:
+  main:
+    resources:
+      RemotePlace:
+        name: rpi
+    drivers:  # using shellstrategy.py
+      #ManualPowerDriver: {}
+      ExternalPowerDriver:     ## implements "PowerProtocol"
+        cmd_on: 'ssh pi@10.1.10.200 /usr/bin/gpioset gpiochip4 26=1'
+        cmd_off: 'ssh pi@10.1.10.200 /usr/bin/gpioset gpiochip4 26=0'
+        cmd_cycle: 'ssh pi@10.1.10.200 "/usr/bin/gpioset gpiochip4 26=0 && sleep 1 && /usr/bin/gpioset gpiochip4 26=1"'
+      SerialDriver: {}         ## implements "ConsoleProtocol"
+      ShellDriver:             ## implements "CommandProtocol, binds to "ConsoleProtocol"
+        prompt: '.*\$ '
+        login_prompt: 'ctrl001 login: '
+        username: 'pi'
+        password: 'xdr5XDR%'
+      USBSDMuxDriver: {}
+      #UBootDriver: {}         ## implements "CommandProtocol, binds to "ConsoleProtocol"
+      #SmallUBootDriver: {}    ## implements "CommandProtocol, binds to "ConsoleProtocol"
+      #QEMUDriver: {}          ## implements "CommandProtocol, binds to "ConsoleProtocol" - TODO
+      ShellStrategy: {}
