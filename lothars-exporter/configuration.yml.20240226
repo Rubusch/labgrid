@@ -1,0 +1,20 @@
+lab:
+  location: rpi
+  USBSerialPort:    # serial /dev/ttyUSB0
+    match:
+      ID_SERIAL_SHORT: FTBW2Z1T
+    speed: 115200
+
+  NetworkInterface: # ethernet
+    ifname: eth0
+
+  USBSDMuxDevice:
+    match:
+      #ID_PATH: platform-xhci-hcd.0-usb-0:1.1
+      ID_SERIAL_SHORT: '000000001444'
+
+  USBMassStorage:
+    match:
+      #ID_PATH: platform-xhci-hcd.0-usb-0:1.1:1.0-scsi-0:0:0:0
+      ID_SERIAL_SHORT: '000000001444'
+
