@@ -1,5 +1,5 @@
 targets:
-  lab:
+  main:
     resources:
       RemotePlace:
         name: rpi

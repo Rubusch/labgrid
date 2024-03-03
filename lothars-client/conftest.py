@@ -2,6 +2,6 @@
 import pytest
 
 @pytest.fixture
-def shell(strategy):
+def shell(strategy):	
 	strategy.transition("shell")
 	return strategy.shell
