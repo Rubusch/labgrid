@@ -1,8 +1,7 @@
+""" ref: docs.pytest.org/en/6.2.x/fixture.html """
 import pytest
-
 
 @pytest.fixture
 def shell(strategy):
-	startegy.transition("shell")
+	strategy.transition("shell")
 	return strategy.shell
-
