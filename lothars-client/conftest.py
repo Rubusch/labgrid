@@ -3,5 +3,5 @@ import pytest
 
 @pytest.fixture
 def shell(strategy):	
-	strategy.transition("shell")
-	return strategy.shell
+  strategy.transition("shell")
+  return strategy.shell
