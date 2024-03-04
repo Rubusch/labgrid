@@ -8,6 +8,11 @@ lab:
   NetworkInterface: # ethernet
     ifname: eth0
 
+  NetworkService:
+    address: 10.1.10.17
+    username: root
+    password: "xdr5XDR%"
+
   USBSDMuxDevice:
     match:
       ID_SERIAL_SHORT: '000000001444'
