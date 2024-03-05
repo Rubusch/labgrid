@@ -1,0 +1,30 @@
+targets:
+  main:
+    resources:
+      RemotePlace:
+        name: enclustra
+
+    drivers:
+
+      ExternalPowerDriver:     ## implements "PowerProtocol"
+        cmd_on: 'ssh pi@10.1.10.33 /usr/bin/gpioset gpiochip0 26=1'
+        cmd_off: 'ssh pi@10.1.10.33 /usr/bin/gpioset gpiochip0 26=0'
+        cmd_cycle: 'ssh pi@10.1.10.33 "/usr/bin/gpioset gpiochip0 26=0 && sleep 1 && /usr/bin/gpioset gpiochip0 26=1"'
+
+      SerialDriver: {}         ## implements "ConsoleProtocol"
+
+      UBootDriver:
+        prompt: '=> '
+        #boot_commands:
+        #  net: run netboot
+        #  spi: run spiboot
+
+      ShellDriver:             ## implements "CommandProtocol, binds to "ConsoleProtocol"
+        prompt: 'root@refdes-.*\# '
+        login_prompt: 'refdes-.* login: '
+        username: 'root'
+        password: ''
+
+      SSHDriver: {}
+
+      UBootStrategy: {}        ## strategy
