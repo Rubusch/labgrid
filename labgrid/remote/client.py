@@ -869,6 +869,7 @@ class ClientSession:
         target = self._get_target(place)
         from ..resource.power import NetworkPowerPort, PDUDaemonPort
         from ..resource.remote import NetworkUSBPowerPort, NetworkSiSPMPowerPort, NetworkSysfsGPIO
+        from ..resource.remote import NetworkGpiodGPIO
         from ..resource import TasmotaPowerPort, NetworkYKUSHPowerPort
 
         drv = None
@@ -893,6 +894,9 @@ class ClientSession:
                 elif isinstance(resource, NetworkSysfsGPIO):
                     self._get_driver_or_new(target, "GpioDigitalOutputDriver", name=name)
                     drv = self._get_driver_or_new(target, "DigitalOutputPowerDriver", name=name)
+                elif isinstance(resource, NetworkGpiodGPIO):
+                    self._get_driver_or_new(target, "GpiodDigitalOutputDriver", name=name)
+                    drv = self._get_driver_or_new(target, "DigitalOutputPowerDriver", name=name)
                 if drv:
                     break
 
@@ -911,6 +915,7 @@ class ClientSession:
         target = self._get_target(place)
         from ..resource import ModbusTCPCoil, OneWirePIO, HttpDigitalOutput
         from ..resource.remote import NetworkDeditecRelais8, NetworkSysfsGPIO, NetworkLXAIOBusPIO, NetworkHIDRelay
+        from ..resource.remote import NetworkGpiodGPIO
 
         drv = None
         try:
@@ -929,6 +934,8 @@ class ClientSession:
                     drv = self._get_driver_or_new(target, "DeditecRelaisDriver", name=name)
                 elif isinstance(resource, NetworkSysfsGPIO):
                     drv = self._get_driver_or_new(target, "GpioDigitalOutputDriver", name=name)
+                elif isinstance(resource, NetworkGpiodGPIO):
+                    drv = self._get_driver_or_new(target, "GpiodDigitalOutputDriver", name=name)
                 elif isinstance(resource, NetworkLXAIOBusPIO):
                     drv = self._get_driver_or_new(target, "LXAIOBusPIODriver", name=name)
                 elif isinstance(resource, NetworkHIDRelay):
