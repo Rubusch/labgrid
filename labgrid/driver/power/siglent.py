@@ -38,13 +38,18 @@ def power_show(host, port, index):
     with _get_psu(host) as psu:
         v_measured = psu.query(f"MEAS:VOLT? CH{index}")
         a_measured = psu.query(f"MEAS:CURR? CH{index}")
-        w_measured = psu.query(f"MEAS:POWE? CH{index}")
+        # Not every SPD model implements MEAS:POWE?; such a model leaves the
+        # query unanswered, so the read times out and raises VisaIOError.
+        try:
+            w_measured = float(psu.query(f"MEAS:POWE? CH{index}"))
+        except (ValueError, pyvisa.VisaIOError):
+            w_measured = None
         v_set = psu.query(f"CH{index}:VOLT?")
         a_set = psu.query(f"CH{index}:CURR?")
     return {
         "voltage": float(v_measured),
         "amps": float(a_measured),
-        "watts": float(w_measured),
+        "watts": w_measured,
         "v_limit": float(v_set),
         "a_limit": float(a_set)
     }
