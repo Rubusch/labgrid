@@ -16,12 +16,18 @@ import warnings
 from pathlib import Path
 from typing import Dict, Type
 from socket import gethostname, getfqdn
+import pathlib
 
 import attr
 import grpc
 
+from labgrid.remote.grpc.interceptor.client import (
+    IdentityClientStreamStreamInterceptor,
+    IdentityClientUnaryUnaryInterceptor,
+)
+
 from .config import ResourceConfig
-from .common import ResourceEntry, queue_as_aiter
+from .common import ResourceEntry, get_client_credentials, queue_as_aiter
 from .generated import labgrid_coordinator_pb2, labgrid_coordinator_pb2_grpc
 from ..util import get_free_port, labgrid_version
 
@@ -212,7 +218,7 @@ class SerialPortExport(ResourceExport):
                 self.ser2net_bin = "/usr/bin/ser2net"
 
     def __del__(self):
-        if self.child is not None:
+        if getattr(self, "child", None) is not None:
             self.stop()
 
     def _get_start_params(self):
@@ -618,8 +624,27 @@ class ProviderGenericExport(ResourceExport):
 
 
 exports["TFTPProvider"] = ProviderGenericExport
-exports["NFSProvider"] = ProviderGenericExport
 exports["HTTPProvider"] = ProviderGenericExport
+
+
+@attr.s(eq=False)
+class NFSProviderExport(ResourceExport):
+    """ResourceExport for the NFSProvider (no internal/external paths)"""
+
+    def __attrs_post_init__(self):
+        super().__attrs_post_init__()
+        from ..resource import provider
+
+        self.data["cls"] = "RemoteNFSProvider"
+        self.local = provider.NFSProvider(target=None, name=None, **self.local_params)
+
+    def _get_params(self):
+        return {
+            "host": self.host,
+        }
+
+
+exports["NFSProvider"] = NFSProviderExport
 
 
 @attr.s
@@ -808,6 +833,85 @@ class YKUSHPowerPortExport(ResourceExport):
 exports["YKUSHPowerPort"] = YKUSHPowerPortExport
 
 
+@attr.s(eq=False)
+class ADBExport(ResourceExport):
+    """ResourceExport for Android Debug Bridge Devices."""
+
+    def __attrs_post_init__(self):
+        super().__attrs_post_init__()
+        local_cls_name = self.cls
+        self.data["cls"] = f"Network{local_cls_name}"
+        from ..resource import adb
+
+        local_cls = getattr(adb, local_cls_name)
+        self.local = local_cls(target=None, name=None, **self.local_params)
+        self.child = None
+        self.port = None
+
+    def __del__(self):
+        if getattr(self, "child", None) is not None:
+            self.stop()
+
+    def _get_params(self):
+        """Helper function to return parameters"""
+        return {
+            "host": self.host,
+            "port": self.port,
+            "serialno": self.local.serialno,
+        }
+
+    def _start(self, start_params):
+        """Start `adb server` subprocess"""
+        assert self.local.avail
+        self.port = get_free_port()
+
+        # If the exporter is run on the same machine as clients, and the client uses ADB to connect to TCP
+        # clients it will latch onto USB devices. This prevents the exporter from ever starting adb servers
+        # for USB devices.
+        # This will kill the global server to work around this but won't affect the --one-device servers
+        # started by the exporter
+        subprocess.run(["adb", "kill-server"], timeout=10, check=True)
+
+        cmd = [
+            "adb",
+            "server",
+            "nodaemon",
+            "-a",
+            "-P",
+            str(self.port),
+            "--one-device",
+            self.local.serialno,
+        ]
+        self.logger.info("Starting adb server with: %s", " ".join(cmd))
+        self.child = subprocess.Popen(cmd)
+        try:
+            self.child.wait(timeout=0.5)
+            raise ExporterError(f"adb for {self.local.serialno} exited immediately")
+        except subprocess.TimeoutExpired:
+            # good, adb didn't exit immediately
+            pass
+        self.logger.info("started adb for %s on port %s", self.local.serialno, self.port)
+
+    def _stop(self, start_params):
+        assert self.child
+        child = self.child
+        self.child = None
+        port = self.port
+        self.port = None
+        child.terminate()
+        try:
+            child.wait(2.0)  # Give adb a chance to close
+        except subprocess.TimeoutExpired:
+            self.logger.warning("adb for %s still running after SIGTERM", self.local.serialno)
+            log_subprocess_kernel_stack(self.logger, child)
+            child.kill()
+            child.wait(1.0)
+        self.logger.info("stopped adb for %s on port %d", self.local.serialno, port)
+
+
+exports["USBADBDevice"] = ADBExport
+
+
 class Exporter:
     def __init__(self, config) -> None:
         """Set up internal datastructures on successful connection:
@@ -834,10 +938,24 @@ class Exporter:
         if urlsplit(f"//{config['coordinator']}").port is None:
             config["coordinator"] += ":20408"
 
-        self.channel = grpc.aio.insecure_channel(
-            target=config["coordinator"],
-            options=channel_options,
-        )
+        identity = (None, self.name, f"labgrid-exporter {labgrid_version()}")
+        interceptors = [
+            IdentityClientUnaryUnaryInterceptor(*identity),
+            IdentityClientStreamStreamInterceptor(*identity),
+        ]
+        if config["credentials"]:
+            self.channel = grpc.aio.secure_channel(
+                target=config["coordinator"],
+                credentials=config["credentials"],
+                options=channel_options,
+                interceptors=interceptors,
+            )
+        else:
+            self.channel = grpc.aio.insecure_channel(
+                target=config["coordinator"],
+                options=channel_options,
+                interceptors=interceptors,
+            )
         self.stub = labgrid_coordinator_pb2_grpc.CoordinatorStub(self.channel)
         self.out_queue = asyncio.Queue()
         self.pump_task = None
@@ -953,13 +1071,11 @@ class Exporter:
                 reexec = True
             else:
                 logging.exception("unexpected grpc error in coordinator message pump task")
+                raise
         except Exception:
             self.out_queue.put_nowait(None)  # let the sender side exit gracefully
             logging.exception("error in coordinator message pump")
-
-            # only send command response when the other updates have left the queue
-            # perhaps with queue join/task_done
-            # this should be a command from the coordinator
+            raise
 
     async def acquire(self, group_name, resource_name, place_name):
         resource = self.groups.get(group_name, {}).get(resource_name)
@@ -1084,6 +1200,12 @@ def main():
         default=os.environ.get("LG_COORDINATOR", "127.0.0.1:20408"),
         help="coordinator host and port",
     )
+    parser.add_argument("--tls", action="store_true", default=False, help="enable TLS gRPC channel")
+    parser.add_argument(
+        "--cacert",
+        type=pathlib.PurePath,
+        help="path to CA certificate or CA bundle for verifying the coordinator (in PEM format)",
+    )
     parser.add_argument(
         "-n",
         "--name",
@@ -1125,6 +1247,7 @@ def main():
         "hostname": args.hostname or (getfqdn() if args.fqdn else gethostname()),
         "resources": args.resources,
         "coordinator": args.coordinator,
+        "credentials": get_client_credentials(args.tls, args.cacert),
         "isolated": args.isolated,
     }
 

@@ -1,4 +1,5 @@
 import logging
+import copy
 
 import attr
 
@@ -88,7 +89,8 @@ class SerialLoggingReporter:
         step = event.step
         state = event.data.get("state")
         extra = {
-            "step": step,
+            "step": copy.copy(step),
+            "method": event.step.title,
         }
         if step.tag == "console":
             self.loggers[step.source] = logging.getLogger(
@@ -107,10 +109,12 @@ class SerialLoggingReporter:
                 for part in parts:
                     part += b"\r\n"
                     data = self.vt100_replace_cr_nl(part)
+                    extra["data"] = part.decode()
                     logger.log(logging.CONSOLE, self._create_message(event, data), extra=extra)
 
             elif state == "start" and step.args and "data" in step.args:
                 data = self.vt100_replace_cr_nl(step.args["data"])
+                extra["data"] = step.args["data"].decode()
                 logger.log(logging.CONSOLE, self._create_message(event, data), extra=extra)
 
     def flush(self):
@@ -118,17 +122,19 @@ class SerialLoggingReporter:
             return
 
         extra = {
-            "step": self.lastevent.step,
+            "step": copy.copy(self.lastevent.step),
+            "method": self.lastevent.step.title,
         }
         for source, logger in self.loggers.items():
             data = self.vt100_replace_cr_nl(self.bufs[source])
             if data:
+                extra["data"] = self.bufs[source].decode()
                 logger.log(logging.CONSOLE, self._create_message(self.lastevent, data), extra=extra)
             self.bufs[source] = b""
 
 
 class StepLogger:
-    _started = False
+    started = False
     _logger = None
     _serial_logger = None
     _length_limit = 100
@@ -145,21 +151,21 @@ class StepLogger:
     @classmethod
     def start(cls, length_limit=None):
         """starts the StepLogger"""
-        assert not cls._started
+        assert not cls.started
         if cls._logger is None:
             cls._logger = logging.getLogger("StepLogger")
         steps.subscribe(cls.notify)
         cls._serial_logger = SerialLoggingReporter()
-        cls._started = True
+        cls.started = True
         if length_limit is not None:
             cls._length_limit = length_limit
 
     @classmethod
     def stop(cls):
         """stops the StepLogger"""
-        assert cls._started
+        assert cls.started
         steps.unsubscribe(cls.notify)
-        cls._started = False
+        cls.started = False
 
     @classmethod
     def get_prefix(cls, event):
@@ -246,7 +252,7 @@ class StepLogger:
         level = logging.INFO
         extra = {
             "indent_level": event.step.level,
-            "step": event.step,
+            "step": copy.copy(event.step),
             "next_indent_level": cls.get_next_indent(event),
         }
         cls._logger.log(level, message, extra=extra)

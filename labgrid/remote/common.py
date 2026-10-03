@@ -1,4 +1,6 @@
 import asyncio
+import platform
+import subprocess
 import time
 import enum
 import random
@@ -7,8 +9,11 @@ import string
 import logging
 from datetime import datetime
 from fnmatch import fnmatchcase
+from typing import Optional
+import warnings
 
 import attr
+import grpc
 
 from .generated import labgrid_coordinator_pb2
 
@@ -56,6 +61,59 @@ def build_dict_from_map(m):
         else:
             d[k] = getattr(v, kind)
     return d
+
+
+def _fetch_root_certificates_darwin():
+    try:
+        p = subprocess.run(
+            ["security", "find-certificate", "-a", "-p"],
+            capture_output=True,
+            timeout=10,
+        )
+        if p.returncode != 0 or not p.stdout:
+            return None
+        return p.stdout
+    except Exception:
+        logging.exception("unexpected error when fetching certificates from macOS Keychain")
+
+    return None
+
+
+def _fetch_root_certificates_linux():
+    ca_bundle_path = "/etc/ssl/certs/ca-certificates.crt"
+    try:
+        # TODO: Current supports Debian/Ubuntu. Extend to support other distributions.
+        with open(ca_bundle_path, "rb") as f:
+            certs = f.read()
+        if certs:
+            return certs
+    except OSError as e:
+        logging.warning("failed to read CA bundle at %s: %s", ca_bundle_path, e)
+    except Exception:
+        logging.exception("unexpected error while reading ca certificates")
+
+    return None
+
+
+def _fetch_root_certificates():
+    if platform.system() == "Darwin":
+        return _fetch_root_certificates_darwin()
+
+    if platform.system() == "Linux":
+        return _fetch_root_certificates_linux()
+
+    return None
+
+
+def get_client_credentials(tls: bool, cacert=None) -> Optional[grpc.ChannelCredentials]:
+    if not tls:
+        return None
+
+    if not cacert:
+        return grpc.ssl_channel_credentials(root_certificates=_fetch_root_certificates())
+
+    with open(cacert, "rb") as fc:
+        return grpc.ssl_channel_credentials(root_certificates=fc.read())
 
 
 @attr.s(eq=False)
@@ -231,6 +289,9 @@ class Place:
     changed = attr.ib(default=attr.Factory(time.time))
     reservation = attr.ib(default=None)
 
+    def __attrs_post_init__(self):
+        self.logger = logging.getLogger(f"{self}")
+
     def asdict(self):
         # in the coordinator, we have resource objects, otherwise just a path
         acquired_resources = []
@@ -354,7 +415,7 @@ class Place:
                 place.tags[key] = value
             return place
         except TypeError:
-            logging.exception("failed to convert place %s to protobuf", self)
+            self.logger.exception("failed to convert place %s to protobuf", self)
             raise
 
     @classmethod
@@ -378,6 +439,9 @@ class Place:
             changed=pb2.changed,
             reservation=pb2.reservation if pb2.HasField("reservation") else None,
         )
+
+    def __str__(self):
+        return f"Place({self.name})"
 
 
 class ReservationState(enum.Enum):
@@ -481,7 +545,22 @@ class Reservation:
         )
 
 
-async def queue_as_aiter(q):
+def get_metadata_single_value_by_key(metadata, key: str) -> Optional[str]:
+    """Look up a single value by key in a metadata sequence of (key, value) pairs."""
+    values = [v for k, v in metadata or () if k == key]
+
+    if not values:
+        return None
+
+    if len(values) > 1:
+        warnings.warn(
+            "Multiple metadata KV pairs with the same key. The value of the first matching KV pair will be returned."
+        )
+
+    return values[0]
+
+
+async def queue_as_aiter(q, logger=logging.getLogger()):
     try:
         while True:
             try:
@@ -493,7 +572,7 @@ async def queue_as_aiter(q):
                 return
             yield item
             q.task_done()
-            logging.debug("sent message %s", item)
+            logger.debug("sent message %s", item)
     except Exception:
-        logging.exception("error in queue_as_aiter")
+        logger.exception("error in queue_as_aiter")
         raise

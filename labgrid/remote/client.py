@@ -19,7 +19,7 @@ import json
 import itertools
 import ipaddress
 from textwrap import indent
-from socket import gethostname
+from socket import gethostname, gethostbyname
 from getpass import getuser
 from collections import defaultdict, OrderedDict
 from datetime import datetime
@@ -32,6 +32,11 @@ import grpc
 # TODO: drop if Python >= 3.11 guaranteed
 from exceptiongroup import ExceptionGroup  # pylint: disable=redefined-builtin
 
+from labgrid.remote.grpc.interceptor.client import (
+    IdentityClientStreamStreamInterceptor,
+    IdentityClientUnaryUnaryInterceptor,
+)
+
 from .common import (
     ResourceEntry,
     ResourceMatch,
@@ -41,6 +46,7 @@ from .common import (
     TAG_KEY,
     TAG_VAL,
     queue_as_aiter,
+    get_client_credentials,
 )
 from .. import Environment, Target, target_factory
 from ..exceptions import NoDriverFoundError, NoResourceFoundError, InvalidConfigError
@@ -48,6 +54,7 @@ from .generated import labgrid_coordinator_pb2, labgrid_coordinator_pb2_grpc
 from ..resource.remote import RemotePlaceManager, RemotePlace
 from ..util import diff_dict, flat_dict, dump, atomic_replace, labgrid_version, Timeout
 from ..util.proxy import proxymanager
+from ..util.ssh import sshmanager
 from ..util.helper import processwrapper
 from ..driver import Mode, ExecutionError
 from ..logging import basicConfig, StepLogger
@@ -92,6 +99,11 @@ class ClientSession:
     the coordinator."""
 
     address = attr.ib(validator=attr.validators.instance_of(str))
+    credentials = attr.ib(
+        default=None,
+        kw_only=True,
+        validator=attr.validators.optional(attr.validators.instance_of(grpc.ChannelCredentials)),
+    )
     loop = attr.ib(validator=attr.validators.instance_of(asyncio.BaseEventLoop))
     env = attr.ib(default=None, validator=attr.validators.optional(attr.validators.instance_of(Environment)))
     role = attr.ib(default=None, validator=attr.validators.optional(attr.validators.instance_of(str)))
@@ -120,10 +132,30 @@ class ClientSession:
             ("grpc.http2.max_pings_without_data", 0),  # no limit
         ]
 
-        self.channel = grpc.aio.insecure_channel(
-            target=self.address,
-            options=channel_options,
-        )
+        identity = {
+            "username": self.getuser(),
+            "hostname": self.gethostname(),
+            "user_agent": f"labgrid-client {labgrid_version()}",
+        }
+        interceptors = [
+            IdentityClientUnaryUnaryInterceptor(**identity),
+            IdentityClientStreamStreamInterceptor(**identity),
+        ]
+
+        if self.credentials:
+            self.channel = grpc.aio.secure_channel(
+                target=self.address,
+                credentials=self.credentials,
+                options=channel_options,
+                interceptors=interceptors,
+            )
+        else:
+            self.channel = grpc.aio.insecure_channel(
+                target=self.address,
+                options=channel_options,
+                interceptors=interceptors,
+            )
+
         self.stub = labgrid_coordinator_pb2_grpc.CoordinatorStub(self.channel)
 
         self.out_queue = asyncio.Queue()
@@ -131,6 +163,8 @@ class ClientSession:
         self.pump_task = None
         self.sync_id = itertools.count(start=1)
         self.sync_events = {}
+
+        self.logger = logging.getLogger("ClientSession")
 
     async def start(self):
         """Starts receiving resource and place updates from the coordinator."""
@@ -173,13 +207,13 @@ class ClientSession:
         event = self.sync_events[identifier] = asyncio.Event()
         msg = labgrid_coordinator_pb2.ClientInMessage()
         msg.sync.id = identifier
-        logging.debug("sending sync %s", identifier)
+        self.logger.debug("sending sync %s", identifier)
         self.out_queue.put_nowait(msg)
         await event.wait()
         if self.stopping.is_set():
-            logging.debug("sync %s failed", identifier)
+            self.logger.debug("sync %s failed", identifier)
         else:
-            logging.debug("received sync %s", identifier)
+            self.logger.debug("received sync %s", identifier)
         return not self.stopping.is_set()
 
     def cancel_pending_syncs(self):
@@ -188,7 +222,7 @@ class ClientSession:
         while True:
             try:
                 identifier, event = self.sync_events.popitem()
-                logging.debug("cancelling %s %s", identifier, event)
+                self.logger.debug("cancelling %s %s", identifier, event)
                 event.set()
             except KeyError:
                 break
@@ -197,11 +231,11 @@ class ClientSession:
         """Task for receiving resource and place updates."""
         got_message = False
         try:
-            self.stream_call = call = self.stub.ClientStream(queue_as_aiter(self.out_queue))
+            self.stream_call = call = self.stub.ClientStream(queue_as_aiter(self.out_queue, self.logger))
             async for out_msg in call:
                 out_msg: labgrid_coordinator_pb2.ClientOutMessage
                 got_message = True
-                logging.debug("out_msg from coordinator: %s", out_msg)
+                self.logger.debug("out_msg from coordinator: %s", out_msg)
                 for update in out_msg.updates:
                     update_kind = update.WhichOneof("kind")
                     if update_kind == "resource":
@@ -224,20 +258,20 @@ class ClientSession:
                         place_name = update.del_place
                         await self.on_place_deleted(place_name)
                     else:
-                        logging.warning("unknown update from coordinator! %s", update_kind)
+                        self.logger.warning("unknown update from coordinator! %s", update_kind)
                 if out_msg.HasField("sync"):
                     event = self.sync_events.pop(out_msg.sync.id)
                     event.set()
         except grpc.aio.AioRpcError as e:
             if e.code() == grpc.StatusCode.UNAVAILABLE:
                 if got_message:
-                    logging.error("coordinator became unavailable: %s", e.details())
+                    self.logger.error("coordinator became unavailable: %s", e.details())
                 else:
-                    logging.error("coordinator is unavailable: %s", e.details())
+                    self.logger.error("coordinator is unavailable: %s", e.details())
             else:
-                logging.exception("unexpected grpc error in coordinator message pump task")
+                self.logger.exception("unexpected grpc error in coordinator message pump task")
         except Exception:
-            logging.exception("error in coordinator message pump task")
+            self.logger.exception("error in coordinator message pump task")
         finally:
             self.stopping.set()
             self.out_queue.put_nowait(None)  # let the sender side exit gracefully
@@ -419,7 +453,7 @@ class ClientSession:
             if self.args.show_exporters:
                 exporters = {resource_path[0] for resource_path in place.acquired_resources}
                 result[-1].append(", ".join(sorted(exporters)))
-        result.sort()
+        result[1:] = sorted(result[1:])
 
         widths = [max(map(len, c)) for c in zip(*result)]
         layout = []
@@ -1010,7 +1044,10 @@ class ClientSession:
 
         drv = None
         try:
-            drv = target.get_driver("DigitalOutputProtocol", name=name)
+            if action == "get":
+                drv = target.get_driver("DigitalInputProtocol", name=name)
+            else:
+                drv = target.get_driver("DigitalOutputProtocol", name=name)
         except NoDriverFoundError:
             for resource in target.resources:
                 if name and resource.name != name:
@@ -1084,13 +1121,13 @@ class ClientSession:
         else:
             call = ["telnet", host, str(port)]
 
-            logging.info("microcom not available, using telnet instead")
+            self.logger.info("microcom not available, using telnet instead")
 
             if listen_only:
-                logging.warning("--listenonly option not supported by telnet, ignoring")
+                self.logger.warning("--listenonly option not supported by telnet, ignoring")
 
             if logfile:
-                logging.warning("--logfile option not supported by telnet, ignoring")
+                self.logger.warning("--logfile option not supported by telnet, ignoring")
 
         print(f"connecting to {resource} calling {' '.join(call)}")
         try:
@@ -1679,6 +1716,100 @@ class ClientSession:
     def print_version(self):
         print(labgrid_version())
 
+    def adb(self):
+        place = self.get_acquired_place()
+        target = self._get_target(place)
+        name = self.args.name
+        adb_cmd = ["adb"]
+
+        from ..resource.adb import RemoteUSBADBDevice, NetworkADBDevice
+
+        for resource in target.resources:
+            if name and resource.name != name:
+                continue
+            if isinstance(resource, RemoteUSBADBDevice):
+                host, port = proxymanager.get_host_and_port(resource)
+                adb_cmd = ["adb", "-H", host, "-P", str(port), "-s", resource.serialno]
+                break
+            elif isinstance(resource, NetworkADBDevice):
+                host, port = proxymanager.get_host_and_port(resource)
+                # ADB does not automatically remove a network device from its
+                # devices list when the connection is broken by the remote, so the
+                # adb connection may have gone "stale", resulting in adb blocking
+                # indefinitely when making calls to the device. To avoid this,
+                # always disconnect first.
+                subprocess.run(
+                    ["adb", "disconnect", f"{host}:{str(port)}"], stderr=subprocess.DEVNULL, timeout=10, check=True
+                )
+                subprocess.run(
+                    ["adb", "connect", f"{host}:{str(port)}"], stdout=subprocess.DEVNULL, timeout=10, check=True
+                )  # Connect adb client to TCP adb device
+                adb_cmd = ["adb", "-s", f"{host}:{str(port)}"]
+                break
+
+        adb_cmd += self.args.leftover
+        subprocess.run(adb_cmd, check=True)
+
+    def scrcpy(self):
+        place = self.get_acquired_place()
+        target = self._get_target(place)
+        name = self.args.name
+        scrcpy_cmd = ["scrcpy"]
+        env_var = os.environ.copy()
+
+        from ..resource.adb import RemoteUSBADBDevice, NetworkADBDevice
+
+        for resource in target.resources:
+            if name and resource.name != name:
+                continue
+            if isinstance(resource, RemoteUSBADBDevice):
+                host, adb_port = proxymanager.get_host_and_port(resource)
+                ip_addr = gethostbyname(host)
+                env_var["ADB_SERVER_SOCKET"] = f"tcp:{ip_addr}:{adb_port}"
+
+                # Find a free port on the exporter machine
+                scrcpy_port = sshmanager.get(host).run_check(
+                    'python -c "'
+                    "import socket;"
+                    "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(("
+                    "'', 0));"
+                    "addr = s.getsockname();"
+                    "print(addr[1]);"
+                    's.close()"'
+                )[0]
+
+                scrcpy_cmd = [
+                    "scrcpy",
+                    "--port",
+                    scrcpy_port,
+                    "-s",
+                    resource.serialno,
+                ]
+
+                # If a proxy is required, we need to setup a ssh port forward for the port
+                # (27183) scrcpy will use to send data along side the adb port
+                if resource.extra.get("proxy_required") or self.args.proxy:
+                    proxy = resource.extra.get("proxy")
+                    scrcpy_cmd.append(f"--tunnel-host={ip_addr}")
+                    scrcpy_cmd.append(f"--tunnel-port={sshmanager.request_forward(proxy, host, int(scrcpy_port))}")
+                break
+
+            elif isinstance(resource, NetworkADBDevice):
+                host, port = proxymanager.get_host_and_port(resource)
+                # ADB does not automatically remove a network device from its
+                # devices list when the connection is broken by the remote, so the
+                # adb connection may have gone "stale", resulting in adb blocking
+                # indefinitely when making calls to the device. To avoid this,
+                # always disconnect first.
+                subprocess.run(
+                    ["adb", "disconnect", f"{host}:{str(port)}"], stderr=subprocess.DEVNULL, timeout=10, check=True
+                )
+                scrcpy_cmd = ["scrcpy", f"--tcpip={host}:{str(port)}"]
+                break
+
+        scrcpy_cmd += self.args.leftover
+        subprocess.run(scrcpy_cmd, env=env_var, check=True)
+
 
 _loop: ContextVar["asyncio.AbstractEventLoop | None"] = ContextVar("_loop", default=None)
 
@@ -1717,7 +1848,12 @@ def ensure_event_loop(external_loop=None):
 
 
 def start_session(
-    address: str, *, extra: Dict[str, Any] = None, debug: bool = False, loop: "asyncio.AbstractEventLoop | None" = None
+    address: str,
+    *,
+    extra: Dict[str, Any] = None,
+    credentials: grpc.ChannelCredentials = None,
+    debug: bool = False,
+    loop: "asyncio.AbstractEventLoop | None" = None,
 ):
     """
     Starts a ClientSession.
@@ -1725,6 +1861,8 @@ def start_session(
     Args:
         address: coordinator address as HOST[:PORT], PORT defaults to 20408
         extra: additional kwargs for ClientSession
+        credentials: optional gRPC channel credentials; when None, use an
+              insecure channel
         debug: set debug mode of the event loop
         loop: explicit event loop to use (otherwise a previously stashed loop,
               if retrievable the current thread's loop or a new loop is used)
@@ -1739,7 +1877,7 @@ def start_session(
 
     address = proxymanager.get_grpc_address(address, default_port=20408)
 
-    session = ClientSession(address, loop, **extra)
+    session = ClientSession(address, loop, credentials=credentials, **extra)
     loop.run_until_complete(session.start())
     return session
 
@@ -1866,6 +2004,17 @@ def get_parser(auto_doc_mode=False) -> "argparse.ArgumentParser | AutoProgramArg
         metavar="ADDRESS",
         type=str,
         help="coordinator HOST[:PORT] (default: value from env variable LG_COORDINATOR, otherwise 127.0.0.1:20408)",
+    )
+    parser.add_argument(
+        "--tls",
+        action="store_true",
+        default=os.environ.get("LG_COORDINATOR_TLS", "").strip().lower() in {"1", "true"},
+        help="enable TLS gRPC channel",
+    )
+    parser.add_argument(
+        "--cacert",
+        type=pathlib.PurePath,
+        help="path to CA certificate or CA bundle for verifying the coordinator (in PEM format)",
     )
     parser.add_argument(
         "-c",
@@ -2258,6 +2407,18 @@ def get_parser(auto_doc_mode=False) -> "argparse.ArgumentParser | AutoProgramArg
     subparser = subparsers.add_parser("version", help="show version")
     subparser.set_defaults(func=ClientSession.print_version)
 
+    adb_subparser = subparsers.add_parser("adb", help="Run Android Debug Bridge")
+    adb_subparser.add_argument("--name", "-n", help="optional resource name")
+    adb_subparser.add_argument(
+        "adb_args", nargs=argparse.REMAINDER, help="adb command to execute (e.g. 'shell', 'devices', etc.)"
+    )
+    adb_subparser.set_defaults(func=ClientSession.adb)
+
+    adb_subparsers = adb_subparser.add_subparsers(dest="adb_command")
+    scrcpy_subparser = adb_subparsers.add_parser("scrcpy", help="Run scrcpy to remote control an android device")
+    scrcpy_subparser.add_argument("--name", "-n", help="optional resource name")
+    scrcpy_subparser.set_defaults(func=ClientSession.scrcpy)
+
     return parser
 
 
@@ -2284,7 +2445,7 @@ def main():
 
     # make any leftover arguments available for some commands
     args, leftover = parser.parse_known_args()
-    if args.command not in ["ssh", "rsync", "forward"]:
+    if args.command not in ["ssh", "rsync", "forward", "adb", "scrcpy"]:
         args = parser.parse_args()
     else:
         args.leftover = leftover
@@ -2364,10 +2525,30 @@ def main():
                 # in case of no env or not set, use LG_COORDINATOR env variable or default
                 coordinator_address = os.environ.get("LG_COORDINATOR", "127.0.0.1:20408")
 
+            tls = args.tls
+            cacert = args.cacert
+            if env:
+                tls = env.config.get_option("coordinator_tls", tls)
+                if isinstance(tls, str):
+                    tls = tls.strip().lower() == "true"
+                else:
+                    tls = tls is True
+
+                if not cacert:
+                    cacert = env.config.get_option("coordinator_cacert", "")
+                    if cacert:
+                        cacert = env.config.resolve_path(str(cacert))
+
             logging.debug('Starting session with "%s"', coordinator_address)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            session = start_session(coordinator_address, extra=extra, debug=args.debug, loop=loop)
+            session = start_session(
+                coordinator_address,
+                extra=extra,
+                credentials=get_client_credentials(tls, cacert),
+                debug=args.debug,
+                loop=loop,
+            )
             logging.debug("Started session")
 
             try:

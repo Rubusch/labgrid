@@ -10,10 +10,14 @@ from contextlib import contextmanager
 import copy
 import random
 import signal
+import pathlib
+from typing import Optional
 
 import attr
 import grpc
 from grpc_reflection.v1alpha import reflection
+
+from labgrid.remote.identity import ClientIdentity, infer_peer_identity
 
 from .common import (
     ResourceEntry,
@@ -182,6 +186,15 @@ def locked(func):
     return wrapper
 
 
+def add_identity(func):
+    @wraps(func)
+    async def wrapper(self, request, context):
+        identity = ClientIdentity.from_metadata(context.invocation_metadata())
+        return await func(self, request, context, identity=identity)
+
+    return wrapper
+
+
 class ExporterCommand:
     def __init__(self, request) -> None:
         self.request = request
@@ -317,9 +330,15 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
         assert peer not in self.clients
         out_msg_queue = asyncio.Queue()
 
+        identity = ClientIdentity.from_metadata(context.invocation_metadata())
+        if identity:
+            logging.debug("client identity provided in gRPC metadata: %s", identity)
+            self.clients[peer] = ClientSession(self, peer, identity.id, out_msg_queue, identity.user_agent)
+
         async def request_task():
             name = None
             version = None
+            session = self.clients.get(peer)
             try:
                 async for in_msg in request_iterator:
                     in_msg: labgrid_coordinator_pb2.ClientInMessage
@@ -330,8 +349,17 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
                         out_msg.sync.id = in_msg.sync.id
                         out_msg_queue.put_nowait(out_msg)
                     elif kind == "startup":
-                        version = in_msg.startup.version
+                        if session:
+                            logging.debug("ignoring legacy startup message from client %s", peer)
+                            name = session.name
+                            version = identity.user_agent
+                            continue
                         name = in_msg.startup.name
+                        version = in_msg.startup.version
+                        logging.warning(
+                            "client %s did not provide identity metadata; using deprecated startup identity",
+                            peer,
+                        )
                         session = self.clients[peer] = ClientSession(self, peer, name, out_msg_queue, version)
                         logging.debug("Received startup from %s with %s", name, version)
                         asyncio.current_task().set_name(f"client-{peer}-rx/started-{name}")
@@ -378,6 +406,26 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
             if exporter.name == name:
                 return exporter
 
+    async def _cleanup_exporter(self, peer, request_task):
+        request_task.cancel()
+        try:
+            await request_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.exception("error in exporter request task during cleanup")
+
+        session = self.exporters.pop(peer, None)
+        if session is None:
+            logging.info("Never received startup from peer %s that disconnected", peer)
+            return
+
+        for groupname, group in session.groups.items():
+            for resourcename in group.copy():
+                session.set_resource(groupname, resourcename, None)
+
+        logging.debug("exporter aborted %s", peer)
+
     def _publish_place(self, place):
         msg = labgrid_coordinator_pb2.ClientOutMessage()
         msg.updates.add().place.CopyFrom(place.as_pb2())
@@ -409,9 +457,21 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
         out_msg.hello.version = labgrid_version()
         yield out_msg
 
+        identity = ClientIdentity.from_metadata(context.invocation_metadata())
+        if identity:
+            logging.debug("exporter identity provided in gRPC metadata: %s", identity)
+            if existing := self.get_exporter_by_name(identity.id):
+                await context.abort(
+                    grpc.StatusCode.ALREADY_EXISTS,
+                    f"startup failed: exporter with name '{identity.id}' is already connected from {existing.peer}",
+                )
+            self.exporters[peer] = ExporterSession(self, peer, identity.id, command_queue, identity.user_agent)
+            startup_done.set()
+
         async def request_task():
             name = None
             version = None
+            session = self.exporters.get(peer)
             try:
                 async for in_msg in request_iterator:
                     in_msg: labgrid_coordinator_pb2.ExporterInMessage
@@ -422,8 +482,17 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
                         cmd.complete(in_msg.response)
                         logging.debug("Command %s is done", cmd)
                     elif kind == "startup":
-                        version = in_msg.startup.version
+                        if session:
+                            logging.debug("ignoring legacy startup message from exporter %s", peer)
+                            name = session.name
+                            version = identity.user_agent
+                            continue
                         name = in_msg.startup.name
+                        version = in_msg.startup.version
+                        logging.warning(
+                            "exporter %s did not provide identity metadata; using deprecated startup identity",
+                            peer,
+                        )
                         if existing := self.get_exporter_by_name(name):
                             raise ExporterError(
                                 f"exporter with name '{name}' is already connected from {existing.peer}"
@@ -453,28 +522,26 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
         asyncio.current_task().set_name(f"exporter-{peer}-tx")
         running_request_task = self.loop.create_task(request_task(), name=f"exporter-{peer}-rx/init")
 
-        startup_done_task = self.loop.create_task(startup_done.wait())
-        done, _ = await asyncio.wait(
-            {startup_done_task, running_request_task},
-            timeout=3,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        # clean up event task
-        startup_done.set()
-        await startup_done_task
-        if running_request_task in done:
-            # we probably had an exception during startup
-            try:
-                await running_request_task
-            except ExporterError as e:
-                await context.abort(grpc.StatusCode.ALREADY_EXISTS, f"startup failed: {e}")
-                raise
-        elif startup_done_task in done:
-            await startup_done_task
-        else:
-            raise ExporterError(f"exporter connection from {peer} timed out during startup")
-
         try:
+            startup_done_task = self.loop.create_task(startup_done.wait())
+            done, _ = await asyncio.wait(
+                {startup_done_task, running_request_task},
+                timeout=3,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # clean up event task
+            startup_done.set()
+            await startup_done_task
+            if running_request_task in done:
+                # we probably had an exception during startup
+                try:
+                    await running_request_task
+                except ExporterError as e:
+                    await context.abort(grpc.StatusCode.ALREADY_EXISTS, f"startup failed: {e}")
+                    raise
+            elif startup_done_task not in done:
+                raise ExporterError(f"exporter connection from {peer} timed out during startup")
+
             async for cmd in queue_as_aiter(command_queue):
                 logging.debug("exporter cmd %s", cmd)
                 out_msg = labgrid_coordinator_pb2.ExporterOutMessage()
@@ -485,19 +552,9 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
             logging.info("exporter disconnected %s", context.peer())
         except Exception:
             logging.exception("error in exporter command handler")
+            raise
         finally:
-            running_request_task.cancel()
-            await running_request_task
-
-            try:
-                session = self.exporters.pop(peer)
-                for groupname, group in session.groups.items():
-                    for resourcename in group.copy():
-                        session.set_resource(groupname, resourcename, None)
-
-                logging.debug("exporter aborted %s, cancelled: %s", context.peer(), context.cancelled())
-            except KeyError:
-                logging.info("Never received startup from peer %s that disconnected", peer)
+            await self._cleanup_exporter(peer, running_request_task)
 
     @locked
     async def AddPlace(self, request, context):
@@ -847,12 +904,13 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
             idx = place.acquired_resources.index(oldresource)
             place.acquired_resources[idx] = newresource
 
+    @add_identity
     @locked
-    async def AcquirePlace(self, request, context):
+    async def AcquirePlace(self, request, context, *, identity):
         peer = context.peer()
         name = request.placename
         try:
-            username = self.clients[peer].name
+            username = infer_peer_identity(self.clients, context, identity)
         except KeyError:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"Peer {peer} does not have a valid session")
         print(request)
@@ -916,13 +974,14 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
         print(f"{place.name}: place released")
         return labgrid_coordinator_pb2.ReleasePlaceResponse()
 
+    @add_identity
     @locked
-    async def AllowPlace(self, request, context):
+    async def AllowPlace(self, request, context, *, identity):
         placename = request.placename
         user = request.user
         peer = context.peer()
         try:
-            username = self.clients[peer].name
+            username = infer_peer_identity(self.clients, context, identity)
         except KeyError:
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"Peer {peer} does not have a valid session")
         try:
@@ -1059,8 +1118,9 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
             if old_map.get(name) != new_map.get(name):
                 self._publish_place(self.places[name])
 
+    @add_identity
     @locked
-    async def CreateReservation(self, request: labgrid_coordinator_pb2.CreateReservationRequest, context):
+    async def CreateReservation(self, request: labgrid_coordinator_pb2.CreateReservationRequest, context, *, identity):
         peer = context.peer()
 
         fltrs = {}
@@ -1077,7 +1137,10 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
                     await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Value {v} is invalid")
                 fltr[k] = v
 
-        owner = self.clients[peer].name
+        try:
+            owner = infer_peer_identity(self.clients, context, identity)
+        except KeyError:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, f"Peer {peer} does not have a valid session")
         res = Reservation(owner=owner, prio=request.prio, filters=fltrs)
         self.reservations[res.token] = res
         self.schedule_reservations()
@@ -1110,7 +1173,7 @@ class Coordinator(labgrid_coordinator_pb2_grpc.CoordinatorServicer):
         return labgrid_coordinator_pb2.GetReservationsResponse(reservations=reservations)
 
 
-async def serve(listen, cleanup) -> None:
+async def serve(listen, cleanup, server_credentials=None) -> None:
     asyncio.current_task().set_name("coordinator-serve")
     # It seems since https://github.com/grpc/grpc/pull/34647, the
     # ping_timeout_ms default of 60 seconds overrides keepalive_timeout_ms,
@@ -1147,7 +1210,11 @@ async def serve(listen, cleanup) -> None:
     except ImportError:
         logging.info("Module grpcio-channelz not available")
 
-    bound = server.add_insecure_port(listen)
+    if server_credentials:
+        bound = server.add_secure_port(listen, server_credentials)
+    else:
+        bound = server.add_insecure_port(listen)
+
     logging.debug("Starting server")
     await server.start()
 
@@ -1176,6 +1243,18 @@ async def serve(listen, cleanup) -> None:
     await server.wait_for_termination()
 
 
+def get_server_credentials(args: argparse.Namespace) -> Optional[grpc.ServerCredentials]:
+    if not args.tls:
+        return None
+
+    if not args.cert or not args.key:
+        raise RuntimeError("--cert and --key must be provided when --tls is provided")
+
+    with open(args.key, "rb") as fk:
+        with open(args.cert, "rb") as fc:
+            return grpc.ssl_server_credentials([(fk.read(), fc.read())])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1186,6 +1265,9 @@ def main():
         default="[::]:20408",
         help="coordinator listening host and port",
     )
+    parser.add_argument("--tls", action="store_true", default=False, help="enable TLS gRPC channel")
+    parser.add_argument("--cert", type=pathlib.PurePath, help="path to server TLS certificate (in PEM format)")
+    parser.add_argument("--key", type=pathlib.PurePath, help="path to TLS key (in PEM format)")
     parser.add_argument("-d", "--debug", action="store_true", default=False, help="enable debug mode")
     parser.add_argument("--pystuck", action="store_true", help="enable pystuck")
     parser.add_argument(
@@ -1215,7 +1297,8 @@ def main():
     cleanup = []
     loop.set_debug(True)
     try:
-        loop.run_until_complete(serve(args.listen, cleanup))
+        server_credentials = get_server_credentials(args)
+        loop.run_until_complete(serve(args.listen, cleanup, server_credentials))
     finally:
         if cleanup:
             loop.run_until_complete(*cleanup)

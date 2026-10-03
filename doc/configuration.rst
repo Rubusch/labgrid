@@ -229,6 +229,13 @@ Currently available are:
   <https://github.com/labgrid-project/labgrid/blob/master/labgrid/driver/power/rest.py>`__
   for details.
 
+``rpm1521``
+  Controls *Minuteman RPM1521* series networked power switches (2, 4 and 8 port
+  variants) via an HTTP CGI interface.
+  See the `docstring in the module
+  <https://github.com/labgrid-project/labgrid/blob/master/labgrid/driver/power/rpm1521.py>`__
+  for details.
+
 ``sentry``
   Controls *Sentry PDUs* via SNMP using Sentry3-MIB.
   It was tested on *CW-24VDD* and *4805-XLS-16*.
@@ -491,6 +498,8 @@ A :any:`DeditecRelais8` describes a *Deditec USB GPO module* with 8 relays.
      match:
        ID_PATH: 'pci-0000:00:14.0-usb-0:2:1.0'
 
+Symlink ``labgrid-python3`` in ``PATH`` to the labgrid virtualenv's ``bin/python3``.
+
 Arguments:
   - index (int): number of the relay to use
   - invert (bool, default=False): whether the logic level is inverted
@@ -570,6 +579,8 @@ It currently supports the widely used *dcttech USBRelay* and *lctech LCUS*
      invert: false
      match:
        ID_PATH: 'pci-0000:00:14.0-usb-0:2:1.0'
+
+Symlink ``labgrid-python3`` in ``PATH`` to the labgrid virtualenv's ``bin/python3``.
 
 Arguments:
   - index (int, default=1): number of the relay to use
@@ -655,6 +666,7 @@ Arguments:
   - invert (bool, default=False): optional, whether the logic level is inverted (active-low)
 
 Used by:
+  - `GpioDigitalInputDriver`_
   - `GpioDigitalOutputDriver`_
 
 NetworkSysfsGPIO
@@ -688,6 +700,7 @@ Arguments:
   - invert (bool, default=False): optional, whether the logic level is inverted (active-low)
 
 Used by:
+  - `GpioDigitalInputDriver`_
   - `GpioDigitalOutputDriver`_
 
 NetworkService
@@ -1411,6 +1424,31 @@ Arguments:
 
 Used by:
   - none
+
+ADB
+~~~
+
+USBADBDevice
+++++++++++++
+
+:any:`USBADBDevice` describes a local adb device connected via USB.
+
+Arguments:
+ - serialno (str): The serial number of the device as shown by adb
+
+RemoteUSBADBDevice
+++++++++++++++++++
+
+A :any:`RemoteUSBADBDevice` describes a `USBADBDevice`_ available on a remote computer.
+
+NetworkADBDevice
+++++++++++++++++
+
+:any:`NetworkADBDevice` describes an ADB device available via TCP.
+
+Arguments:
+ - host (str): The address of the TCP ADP device
+ - port (int): The TCP port ADB is exposed on the device
 
 Providers
 ~~~~~~~~~
@@ -2297,6 +2335,12 @@ OpenOCDDriver
 An :any:`OpenOCDDriver` controls *OpenOCD* to bootstrap a target with a
 bootloader.
 
+The driver disables OpenOCD's GDB, telnet and TCL server ports. It does not
+provide a lifecycle to expose or stop these server interfaces, and disabling
+them allows multiple bootstrap operations to run concurrently on one exporter.
+Configurations which require a server interface can re-enable it with an
+appropriate command before ``init``.
+
 Note that OpenOCD supports specifying USB paths since
 `a1b308ab <https://sourceforge.net/p/openocd/code/ci/a1b308ab/>`_ which was released with v0.11.
 The OpenOCDDriver passes the resource's USB path.
@@ -2569,6 +2613,30 @@ Implements:
 
 Arguments:
   - delay (float, default=2.0): delay in seconds between off and on
+
+GpioDigitalInputDriver
+~~~~~~~~~~~~~~~~~~~~~~
+The :any:`GpioDigitalInputDriver` reads a digital signal from a GPIO line.
+
+This driver configures GPIO lines via
+`the sysfs kernel interface <https://www.kernel.org/doc/html/latest/gpio/sysfs.html>`__
+as an input.
+
+Binds to:
+  gpio:
+    - `SysfsGPIO`_
+    - `MatchedSysfsGPIO`_
+    - `NetworkSysfsGPIO`_
+
+Implements:
+  - :any:`DigitalInputProtocol`
+
+.. code-block:: yaml
+
+   GpioDigitalInputDriver: {}
+
+Arguments:
+  - None
 
 GpioDigitalOutputDriver
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -3096,9 +3164,9 @@ Implements:
 
 Arguments:
   - qemu_bin (str): reference to the tools key for the QEMU binary
-  - machine (str): QEMU machine type
-  - cpu (str): QEMU cpu type
   - memory (str): QEMU memory size (ends with M or G)
+  - machine (str): optional, QEMU machine type (defaults to default machine of ``qemu_bin``)
+  - cpu (str): optional, QEMU cpu type (defaults to default cpu type of ``qemu_bin``)
   - extra_args (str): optional, extra QEMU arguments, they are passed directly to the QEMU binary
   - boot_args (str): optional, additional kernel boot argument
   - kernel (str): optional, reference to the images key for the kernel
@@ -3905,6 +3973,24 @@ Arguments:
 The ``stage()`` method returns the filename as stored on the LAA.
 The ``list()`` method returns a list of filenames. The ``remove(name)``
 method removes a file by name.
+
+ADBDriver
+~~~~~~~~~
+The :any:`ADBDriver` allows interaction with ADB devices. It allows the 
+execution of commands, transfer of files, and rebooting of the device.
+
+It can interact with both USB and TCP adb devices.
+
+Binds to:
+  iface:
+    - `USBADBDevice`_
+    - `RemoteUSBADBDevice`_
+    - `NetworkADBDevice`_
+
+Implements:
+  - :any:`CommandProtocol`
+  - :any:`FileTransferProtocol`
+  - :any:`ResetProtocol`
 
 .. _conf-strategies:
 
