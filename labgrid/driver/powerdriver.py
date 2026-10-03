@@ -7,7 +7,7 @@ import attr
 
 from ..exceptions import InvalidConfigError
 from ..factory import target_factory
-from ..protocol import PowerProtocol, DigitalOutputProtocol, ResetProtocol, ProgrammablePowerProtocol
+from ..protocol import PowerProtocol, DigitalOutputProtocol, ResetProtocol
 from ..resource import NetworkPowerPort
 from ..step import step
 from ..util.proxy import proxymanager

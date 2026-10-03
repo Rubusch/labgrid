@@ -988,12 +988,11 @@ class ClientSession:
         if action == "get":
             print(f"power{' ' + name if name else ''} for place {place.name} is {'on' if res else 'off'}")
         elif action == "show":
-            print(
-                f"Voltage: {res['voltage']}V [{res['v_limit']}V], "
-                f"Current: {res['amps']}A [{res['a_limit']}A], "
-                f"Power: {res['watts']}W"
-            )
-
+            line = f"Voltage: {res['voltage']}V [{res['v_limit']}V], Current: {res['amps']}A [{res['a_limit']}A]"
+            # not every programmable PSU can measure power directly
+            if res.get("watts") is not None:
+                line += f", Power: {res['watts']}W"
+            print(line)
 
     def digital_io(self):
         place = self.get_acquired_place()
@@ -2006,12 +2005,8 @@ def get_parser(auto_doc_mode=False) -> "argparse.ArgumentParser | AutoProgramArg
     subparser.add_argument(
         "-t", "--delay", type=float, default=None, help="wait time in seconds between off and on during cycle"
     )
-    subparser.add_argument(
-        "-v", "--voltage", type=float, default=None, help="voltage value to be configured"
-    )
-    subparser.add_argument(
-        "-a", "--amps", type=float, default=None, help="amps value to be configured"
-    )
+    subparser.add_argument("-v", "--voltage", type=float, default=None, help="voltage value to be configured")
+    subparser.add_argument("-a", "--amps", type=float, default=None, help="amps value to be configured")
     subparser.add_argument("--name", "-n", help="optional resource name")
     subparser.set_defaults(func=ClientSession.power)
 

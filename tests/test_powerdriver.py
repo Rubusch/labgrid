@@ -368,6 +368,40 @@ class TestNetworkPowerDriver:
             "a_limit": 1.5,
         }
 
+    @pytest.mark.parametrize("failure", ["unanswered", "non-numeric"])
+    def test_siglent_show_without_power_query(self, target, mocker, failure):
+        pytest.importorskip("pyvisa")
+        from pyvisa import constants, errors
+
+        # Not every SPD model implements MEAS:POWE?. Such a model leaves the
+        # query unanswered, so the read times out; report no power rather than
+        # losing the other four readings with it.
+        responses = {
+            "MEAS:VOLT? CH1": "5.001",
+            "MEAS:CURR? CH1": "0.209",
+            "CH1:VOLT?": "5.0",
+            "CH1:CURR?": "1.5",
+        }
+
+        def query(cmd):
+            if cmd in responses:
+                return responses[cmd]
+            if failure == "unanswered":
+                raise errors.VisaIOError(constants.StatusCode.error_timeout)
+            return "not a number"
+
+        psu = self._mock_siglent_psu(mocker)
+        psu.query.side_effect = query
+        d = self._activate_siglent_driver(target)
+
+        assert d.show() == {
+            "voltage": 5.001,
+            "amps": 0.209,
+            "watts": None,
+            "v_limit": 5.0,
+            "a_limit": 1.5,
+        }
+
     def test_siglent_voltage_amps(self, target, mocker):
         pytest.importorskip("pyvisa")
 
